@@ -18,6 +18,8 @@ const (
 	AttrHTTPRequestBodyTruncated  = "tsu.http.request_body_truncated"
 	AttrHTTPResponseBodyTruncated = "tsu.http.response_body_truncated"
 	AttrHTTPBodySkipped           = "tsu.http.body_skipped"
+	AttrHTTPBodySanitized         = "tsu.http.body_sanitized"
+	AttrHTTPBodyCaptureTaskID     = "tsu.http.capture_task_id"
 )
 
 type replayCaptureKey struct{}
@@ -31,6 +33,30 @@ type ReplayConfig struct {
 	CaptureHeader    string
 	CaptureToken     string
 	Environment      string
+}
+
+// BodyCaptureDecision selects which JSON payload sides may be recorded for a
+// completed request. TaskID provides capture provenance when either side is
+// captured.
+type BodyCaptureDecision struct {
+	TaskID       string
+	RequestBody  bool
+	ResponseBody bool
+}
+
+// BodyCapturePolicy decides body capture after the request handler has run.
+type BodyCapturePolicy interface {
+	Decide(fiber.Ctx) BodyCaptureDecision
+}
+
+// BodyCapturePolicyFunc adapts a function into a BodyCapturePolicy.
+type BodyCapturePolicyFunc func(fiber.Ctx) BodyCaptureDecision
+
+func (f BodyCapturePolicyFunc) Decide(ctx fiber.Ctx) BodyCaptureDecision {
+	if f == nil {
+		return BodyCaptureDecision{}
+	}
+	return f(ctx)
 }
 
 // TapMiddleware marks authorized per-request capture before HTTPMiddleware
@@ -66,6 +92,54 @@ func BodyCaptureMiddleware(cfg ReplayConfig) fiber.Handler {
 			if value, truncated, ok := captureBody(ctx.Response().Body(), ctx.GetRespHeader(fiber.HeaderContentType), cfg, IsReplayCapture(ctx.Context())); ok {
 				span.SetAttributes(attribute.String(AttrHTTPResponseBody, value), attribute.Bool(AttrHTTPResponseBodyTruncated, truncated))
 			}
+		}
+		return err
+	}
+}
+
+// PolicyBodyCaptureMiddleware records only the JSON body sides selected by the
+// policy. The policy is evaluated after the handler to allow it to use request
+// state written during handling.
+func PolicyBodyCaptureMiddleware(cfg ReplayConfig, policy BodyCapturePolicy) fiber.Handler {
+	cfg = normalizeReplayConfig(cfg)
+	return func(ctx fiber.Ctx) error {
+		err := ctx.Next()
+		span := oteltrace.SpanFromContext(ctx.Context())
+		if !span.IsRecording() || policy == nil {
+			return err
+		}
+		decision := policy.Decide(ctx)
+		if !decision.RequestBody && !decision.ResponseBody {
+			return err
+		}
+		if matchesRoute(ctx.Path(), cfg.SensitiveRoutes) {
+			span.SetAttributes(attribute.String(AttrHTTPBodySkipped, "sensitive_route"))
+			return err
+		}
+		captured := false
+		if decision.RequestBody {
+			if value, truncated, ok := captureBody(ctx.Body(), ctx.Get(fiber.HeaderContentType), cfg, false); ok {
+				span.SetAttributes(
+					attribute.String(AttrHTTPRequestBody, value),
+					attribute.Bool(AttrHTTPRequestBodyTruncated, truncated),
+				)
+				captured = true
+			}
+		}
+		if decision.ResponseBody {
+			if value, truncated, ok := captureBody(ctx.Response().Body(), ctx.GetRespHeader(fiber.HeaderContentType), cfg, false); ok {
+				span.SetAttributes(
+					attribute.String(AttrHTTPResponseBody, value),
+					attribute.Bool(AttrHTTPResponseBodyTruncated, truncated),
+				)
+				captured = true
+			}
+		}
+		if captured {
+			span.SetAttributes(
+				attribute.Bool(AttrHTTPBodySanitized, true),
+				attribute.String(AttrHTTPBodyCaptureTaskID, strings.TrimSpace(decision.TaskID)),
+			)
 		}
 		return err
 	}
