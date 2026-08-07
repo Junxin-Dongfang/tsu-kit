@@ -3,6 +3,8 @@ package logging
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"os"
 	"strings"
@@ -117,6 +119,57 @@ func TestErrorLevelAndAttributeTypeBranches(t *testing.T) {
 	}
 }
 
+func TestErrorFieldValuesAreStringified(t *testing.T) {
+	sink := &recordingSink{}
+	restore := SetSinks(sink)
+	defer restore()
+
+	wrapped := fmt.Errorf("读取冻结配置失败: %w", errors.New("boom"))
+	Error(context.Background(), "failed", "error", wrapped, "cause", errors.New("boom"))
+
+	if len(sink.entries) != 1 {
+		t.Fatalf("sink entries = %d, want 1", len(sink.entries))
+	}
+	fields := sink.entries[0].Fields
+	if len(fields) != 2 {
+		t.Fatalf("fields = %d, want 2: %#v", len(fields), fields)
+	}
+	if fields[0].Value != "读取冻结配置失败: boom" {
+		t.Fatalf("error field = %#v, want unwrapped Error() text", fields[0].Value)
+	}
+	if fields[1].Value != "boom" {
+		t.Fatalf("cause field = %#v, want %q", fields[1].Value, "boom")
+	}
+
+	line, ok := formatJSONEntry(sink.entries[0])
+	if !ok {
+		t.Fatal("formatJSONEntry returned !ok")
+	}
+	var doc map[string]any
+	if err := json.Unmarshal([]byte(line), &doc); err != nil {
+		t.Fatalf("json output invalid: %v: %s", err, line)
+	}
+	if doc["error"] != "读取冻结配置失败: boom" {
+		t.Fatalf(`doc["error"] = %#v, want Error() text (regression: was {})`, doc["error"])
+	}
+}
+
+func TestTypedNilErrorFieldDoesNotPanic(t *testing.T) {
+	sink := &recordingSink{}
+	restore := SetSinks(sink)
+	defer restore()
+
+	var typedNil *nilProneError
+	Error(context.Background(), "failed", "error", typedNil)
+
+	if len(sink.entries) != 1 {
+		t.Fatalf("sink entries = %d, want 1", len(sink.entries))
+	}
+	if sink.entries[0].Fields[0].Value != "<nil>" {
+		t.Fatalf("typed-nil error field = %#v, want %q", sink.entries[0].Fields[0].Value, "<nil>")
+	}
+}
+
 func TestFormatJSONEntryIncludesBaseFieldsTraceAndKV(t *testing.T) {
 	SetServiceName("game-api")
 	got, ok := formatJSONEntry(Entry{
@@ -225,6 +278,16 @@ type stringerValue string
 
 func (s stringerValue) String() string {
 	return string(s)
+}
+
+// nilProneError 的 Error() 解引用接收者：typed-nil 直接调用会 panic，
+// 用于验证 normalizeFieldValue 的反射判 nil 防护。
+type nilProneError struct {
+	msg string
+}
+
+func (e *nilProneError) Error() string {
+	return e.msg
 }
 
 func attrsMap(attrs []attribute.KeyValue) map[string]string {

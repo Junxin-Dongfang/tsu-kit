@@ -12,6 +12,7 @@ import (
 	"fmt"
 	stdlog "log"
 	"os"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -135,11 +136,43 @@ func fieldsFromKV(kv ...any) []Field {
 		}
 		var value any
 		if i+1 < len(kv) {
-			value = kv[i+1]
+			value = normalizeFieldValue(kv[i+1])
 		}
 		fields = append(fields, Field{Key: key, Value: value})
 	}
 	return fields
+}
+
+// normalizeFieldValue 把 error 值归一化为其 Error() 文本。encoding/json 对不实现
+// json.Marshaler 且无导出字段的 error（errors.New / fmt.Errorf / 各服务的领域错误
+// 类型）一律序列化为 {}，JSON sink 会丢失全部错误详情。在 KV 收口点统一转换，
+// JSON sink / span event / fallback text 三路输出一致受益。
+//
+// typed-nil error（如把 (*SomeError)(nil) 塞进 interface）直接调 Error() 可能
+// panic，经反射判 nil 后回落 "<nil>"。非 error 值原样透传，不改变既有行为。
+func normalizeFieldValue(value any) any {
+	err, ok := value.(error)
+	if !ok {
+		return value
+	}
+	if isNilValue(err) {
+		return "<nil>"
+	}
+	return err.Error()
+}
+
+// isNilValue 判定 interface 内包裹的具体值是否为 nil（typed-nil 防护）。
+func isNilValue(v any) bool {
+	if v == nil {
+		return true
+	}
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Pointer, reflect.Interface, reflect.Map, reflect.Slice, reflect.Chan, reflect.Func:
+		return rv.IsNil()
+	default:
+		return false
+	}
 }
 
 func attributesFromEntry(entry Entry) []attribute.KeyValue {
